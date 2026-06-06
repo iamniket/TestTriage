@@ -1,6 +1,11 @@
+import argparse
 import json
+import os
+import re
 import sys
+from datetime import date
 from openai import BadRequestError
+from fixtures import FAILURE_LOGS
 from providers import get_client
 from tools import AVAILABLE_TOOLS, TOOL_SCHEMAS
 
@@ -47,12 +52,10 @@ def triage_failure(test_name: str, provider: str = "groq"):
                     tools=TOOL_SCHEMAS,
                 )
                 break
-            except BadRequestError as e:
+            except BadRequestError:
                 if attempt == 2:
                     raise
                 print(f"  ⚠ Tool call malformed, retrying ({attempt + 1}/3)…")
-        else:
-            break
 
         msg = response.choices[0].message
         messages.append(msg)
@@ -61,7 +64,7 @@ def triage_failure(test_name: str, provider: str = "groq"):
             print("═" * 60)
             print(msg.content)
             print("═" * 60)
-            break
+            return msg.content
 
         for tool_call in msg.tool_calls:
             fn_name = tool_call.function.name
@@ -77,8 +80,73 @@ def triage_failure(test_name: str, provider: str = "groq"):
             })
 
 
+def _extract_verdict(content: str) -> dict:
+    m = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _write_report(results: list, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    lines = [
+        f"# Test Triage Report — {date.today()}",
+        "",
+        "| Test | Verdict | Confidence | Suggested Action |",
+        "|------|---------|------------|------------------|",
+    ]
+    for test_name, content in results:
+        v = _extract_verdict(content)
+        lines.append(
+            f"| `{test_name}` | {v.get('verdict', '—')} "
+            f"| {v.get('confidence', '—')} "
+            f"| {v.get('suggested_action', '—')} |"
+        )
+    lines += ["", "---", ""]
+    for test_name, content in results:
+        v = _extract_verdict(content)
+        lines += [f"## {test_name}", ""]
+        if v:
+            lines += [
+                f"**Verdict:** {v.get('verdict', '—')}  ",
+                f"**Confidence:** {v.get('confidence', '—')}  ",
+                "",
+                f"**Reasoning:** {v.get('reasoning', '—')}",
+                "",
+                f"**Suggested Action:** {v.get('suggested_action', '—')}",
+            ]
+        else:
+            lines.append(content)
+        lines += ["", "---", ""]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 if __name__ == "__main__":
-    # Try all three failures
-    for test in ["LoginTest.testInvalidPassword", "PaymentTest.testRefund", "DashboardTest.testKpiLoad"]:
-        triage_failure(test, provider="groq")
-        print("\n")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", type=str, help="Triage a single test by name")
+    parser.add_argument("--all", action="store_true", help="Triage all fixture tests")
+    parser.add_argument("--provider", default="groq", choices=["groq", "github", "gemini"])
+    parser.add_argument("--save-report", action="store_true")
+    args = parser.parse_args()
+
+    if args.all:
+        tests_to_run = list(FAILURE_LOGS.keys())   # all 5
+    elif args.test:
+        tests_to_run = [args.test]                  # just this one
+    else:
+        parser.error("Provide either --test <name> or --all")
+
+    results = []
+    for test in tests_to_run:
+        content = triage_failure(test, provider=args.provider)
+        results.append((test, content))
+        print()
+
+    if args.save_report:
+        report_path = f"reports/triage-{date.today()}.md"
+        _write_report(results, report_path)
+        print(f"📄 Report saved to: {report_path}")
